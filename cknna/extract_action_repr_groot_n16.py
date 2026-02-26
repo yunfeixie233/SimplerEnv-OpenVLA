@@ -19,8 +19,8 @@ Requires:
     PYTHONPATH must point to gr00t_1p6/Isaac-GR00T
 
 Usage:
-    PYTHONPATH=/home/ubuntu/verl/gr00t_1p6/Isaac-GR00T python extract_action_repr_groot_n16.py \
-        --ckpt /home/ubuntu/verl/GR00T-N1.6-bridge \
+    PYTHONPATH=$WORK/gr00t_1p6/Isaac-GR00T python extract_action_repr_groot_n16.py \
+        --ckpt $WORK/GR00T-N1.6-bridge \
         --data_dir ./cknna_data \
         --output_dir ./cknna_data/groot-n16-bridge
 """

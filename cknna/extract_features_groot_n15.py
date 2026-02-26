@@ -27,8 +27,8 @@ Requires:
     transformers==4.51.3, flash-attn, Isaac-GR00T on PYTHONPATH
 
 Usage:
-    PYTHONPATH=/home/ubuntu/verl/Isaac-GR00T python extract_features_groot_n15.py \
-        --ckpt /home/ubuntu/verl/GR00T-N1.5-Lerobot-SimplerEnv-BridgeV2 \
+    PYTHONPATH=$WORK/Isaac-GR00T python extract_features_groot_n15.py \
+        --ckpt $WORK/GR00T-N1.5-Lerobot-SimplerEnv-BridgeV2 \
         --data_dir ./cknna_data \
         --output_dir ./cknna_data/groot-n15-bridge
 """

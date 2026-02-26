@@ -14,7 +14,7 @@ Requires: conda env with transformers==4.40.1, timm==0.9.16, torch>=2.1
 
 Usage:
     python extract_action_repr_openvla.py \
-        --ckpt /home/ubuntu/verl/SimplerEnv-OpenVLA/checkpoints/openvla-7b \
+        --ckpt $WORK/SimplerEnv-OpenVLA/checkpoints/openvla-7b \
         --data_dir ./cknna_data \
         --output_dir ./cknna_data/openvla-7b-bridge \
         --seed 42
