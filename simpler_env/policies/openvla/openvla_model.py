@@ -9,6 +9,13 @@ import torch
 import cv2 as cv
 
 
+ECOT_PROMPT_TEMPLATE = (
+    "A chat between a curious user and an artificial intelligence assistant. "
+    "The assistant gives helpful, detailed, and polite answers to the user's questions. "
+    "USER: What action should the robot take to {instruction}? ASSISTANT: TASK:"
+)
+
+
 class OpenVLAInference:
     def __init__(
         self,
@@ -20,7 +27,9 @@ class OpenVLAInference:
         exec_horizon: int = 1,
         image_size: list[int] = [224, 224],
         action_scale: float = 1.0,
+        is_ecot: bool = False,
     ) -> None:
+        self.is_ecot = is_ecot
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
         if policy_setup == "widowx_bridge":
             unnorm_key = "bridge_orig" if unnorm_key is None else unnorm_key
@@ -35,11 +44,11 @@ class OpenVLAInference:
         self.policy_setup = policy_setup
         self.unnorm_key = unnorm_key
 
-        print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key} ***")
+        print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, is_ecot: {is_ecot} ***")
         self.processor = AutoProcessor.from_pretrained(saved_model_path, trust_remote_code=True)
         self.vla = AutoModelForVision2Seq.from_pretrained(
             saved_model_path,
-            attn_implementation="flash_attention_2",  # [Optional] Requires `flash_attn`
+            attn_implementation="flash_attention_2",
             torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
             trust_remote_code=True,
@@ -92,20 +101,30 @@ class OpenVLAInference:
         image = self._resize_image(image)
 
         image: Image.Image = Image.fromarray(image)
-        prompt = task_description
 
-        # predict action (7-dof; un-normalize for bridgev2)
+        if self.is_ecot:
+            prompt = ECOT_PROMPT_TEMPLATE.format(instruction=task_description.lower())
+        else:
+            prompt = f"In: What action should the robot take to {task_description}?\nOut:"
+
         inputs = self.processor(prompt, image).to("cuda:0", dtype=torch.bfloat16)
-        raw_actions = self.vla.predict_action(**inputs, unnorm_key=self.unnorm_key, do_sample=False)[None]
-        # print(f"*** raw actions {raw_actions} ***")
+        predict_kwargs = dict(unnorm_key=self.unnorm_key, do_sample=False)
+        if self.is_ecot:
+            predict_kwargs["max_new_tokens"] = 1024
+        result = self.vla.predict_action(**inputs, **predict_kwargs)
+        actions = result[0] if isinstance(result, tuple) else result
+        if hasattr(actions, 'ndim') and actions.ndim == 2:
+            actions = actions[0]
+        raw_actions = actions[None]
+        if self.num_image_history < 3:
+            print(f"*** step {self.num_image_history}: raw_actions={np.array2string(raw_actions[0], precision=4)} ***")
 
         raw_action = {
             "world_vector": np.array(raw_actions[0, :3]),
             "rotation_delta": np.array(raw_actions[0, 3:6]),
-            "open_gripper": np.array(raw_actions[0, 6:7]),  # range [0, 1]; 1 = open; 0 = close
+            "open_gripper": np.array(raw_actions[0, 6:7]),
         }
 
-        # process raw_action to obtain the action to be sent to the maniskill2 environment
         action = {}
         action["world_vector"] = raw_action["world_vector"] * self.action_scale
         action_rotation_delta = np.asarray(raw_action["rotation_delta"], dtype=np.float64)
@@ -156,13 +175,11 @@ class OpenVLAInference:
 
         img_strip = np.concatenate(np.array(images[::3]), axis=1)
 
-        # set up plt figure
         figure_layout = [["image"] * len(ACTION_DIM_LABELS), ACTION_DIM_LABELS]
         plt.rcParams.update({"font.size": 12})
         fig, axs = plt.subplot_mosaic(figure_layout)
         fig.set_size_inches([45, 10])
 
-        # plot actions
         pred_actions = np.array(
             [
                 np.concatenate([a["world_vector"], a["rotation_delta"], a["open_gripper"]], axis=-1)
@@ -170,7 +187,6 @@ class OpenVLAInference:
             ]
         )
         for action_dim, action_label in enumerate(ACTION_DIM_LABELS):
-            # actions have batch, horizon, dim, in this example we just take the first action for simplicity
             axs[action_label].plot(pred_actions[:, action_dim], label="predicted action")
             axs[action_label].set_title(action_label)
             axs[action_label].set_xlabel("Time in one episode")

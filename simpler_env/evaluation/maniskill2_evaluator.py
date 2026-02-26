@@ -86,14 +86,14 @@ def run_maniskill2_eval_single_episode(
         }
     obs, _ = env.reset(options=env_reset_options)
     # for long-horizon environments, we check if the current subtask is the final subtask
-    is_final_subtask = env.is_final_subtask()
+    is_final_subtask = env.unwrapped.is_final_subtask()
 
     # Obtain language instruction
     if instruction is not None:
         task_description = instruction
     else:
         # get default language instruction
-        task_description = env.get_language_instruction()
+        task_description = env.unwrapped.get_language_instruction()
     print(task_description)
 
     # Initialize logging
@@ -113,14 +113,21 @@ def run_maniskill2_eval_single_episode(
     task_descriptions = []
     while not (predicted_terminated or truncated):
         # step the model; "raw_action" is raw model action output; "action" is the processed action to be sent into maniskill env
-        raw_action, action = model.step(image, task_description, eef_pos=obs["agent"]["eef_pos"])
+        if "extra" in obs and "tcp_pose" in obs["extra"]:
+            tcp_pose = obs["extra"]["tcp_pose"]
+            gripper_qpos = obs["agent"]["qpos"][-2:]
+            gripper_openness = np.mean(gripper_qpos) / 0.037
+            eef_pos = np.concatenate([tcp_pose, [gripper_openness]])
+        else:
+            eef_pos = obs["agent"]["eef_pos"]
+        raw_action, action = model.step(image, task_description, eef_pos=eef_pos)
         predicted_actions.append(raw_action)
         predicted_terminated = bool(action["terminate_episode"][0] > 0)
         if predicted_terminated:
             if not is_final_subtask:
                 # advance the environment to the next subtask
                 predicted_terminated = False
-                env.advance_to_next_subtask()
+                env.unwrapped.advance_to_next_subtask()
 
         # step the environment
         obs, reward, done, truncated, info = env.step(
@@ -130,11 +137,11 @@ def run_maniskill2_eval_single_episode(
         )
 
         success = "success" if done else "failure"
-        new_task_description = env.get_language_instruction()
+        new_task_description = env.unwrapped.get_language_instruction()
         if new_task_description != task_description:
             task_description = new_task_description
             print(task_description)
-        is_final_subtask = env.is_final_subtask()
+        is_final_subtask = env.unwrapped.is_final_subtask()
 
         print(timestep, info)
 

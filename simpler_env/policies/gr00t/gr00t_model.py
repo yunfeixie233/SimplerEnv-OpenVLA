@@ -58,7 +58,7 @@ class Gr00tInference:
                 model_path=saved_model_path,
                 modality_config=modality_config,
                 modality_transform=transforms,
-                embodiment_tag="new_embodiment",
+                embodiment_tag="oxe",
                 device="cuda",
                 denoising_steps=16
             )

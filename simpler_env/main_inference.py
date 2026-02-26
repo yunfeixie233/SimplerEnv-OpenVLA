@@ -60,6 +60,15 @@ if __name__ == "__main__":
             policy_setup=args.policy_setup,
             action_scale=args.action_scale,
         )
+    elif args.policy_model == "ecot":
+        assert args.ckpt_path is not None
+        from simpler_env.policies.openvla.openvla_model import OpenVLAInference
+        model = OpenVLAInference(
+            saved_model_path=args.ckpt_path,
+            policy_setup=args.policy_setup,
+            action_scale=args.action_scale,
+            is_ecot=True,
+        )
     elif args.policy_model == "cogact":
         from simpler_env.policies.sim_cogact import CogACTInference
         assert args.ckpt_path is not None
@@ -67,7 +76,7 @@ if __name__ == "__main__":
             saved_model_path=args.ckpt_path,  # e.g., CogACT/CogACT-Base
             policy_setup=args.policy_setup,
             action_scale=args.action_scale,
-            action_model_type='DiT-L',
+            action_model_type='DiT-B',
             cfg_scale=1.5                     # cfg from 1.5 to 7 also performs well
         )
     elif args.policy_model == "spatialvla":
