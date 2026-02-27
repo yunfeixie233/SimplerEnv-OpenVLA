@@ -150,7 +150,7 @@ class RT1Inference:
         return raw_action
 
     def step(
-        self, image: np.ndarray, task_description: Optional[str] = None
+        self, image: np.ndarray, task_description: Optional[str] = None, *args, **kwargs
     ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         """
         Input:

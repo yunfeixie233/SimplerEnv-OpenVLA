@@ -112,6 +112,8 @@ def get_args():
     parser.add_argument("--logging-dir", type=str, default="./results")
     parser.add_argument("--tf-memory-limit", type=int, default=3072, help="Tensorflow memory limit")
     parser.add_argument("--octo-init-rng", type=int, default=0, help="Octo init rng seed")
+    parser.add_argument("--save-rollout-dir", type=str, default=None, help="Directory to save rollout data for CKNNA")
+    parser.add_argument("--action-model-type", type=str, default="DiT-B", help="CogACT DiT variant: DiT-S, DiT-B, DiT-L")
 
     args = parser.parse_args()
 

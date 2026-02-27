@@ -1,10 +1,16 @@
 import os
 
 import numpy as np
-import tensorflow as tf
 
 from simpler_env.evaluation.argparse import get_args
 from simpler_env.evaluation.maniskill2_evaluator import maniskill2_evaluator
+
+tf = None
+try:
+    import tensorflow as _tf
+    tf = _tf
+except ImportError:
+    pass
 
 try:
     from simpler_env.policies.octo.octo_model import OctoInference
@@ -16,15 +22,14 @@ except ImportError as e:
 if __name__ == "__main__":
     args = get_args()
     os.environ["DISPLAY"] = ""
-    # prevent a single jax process from taking up all the GPU memory
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-    gpus = tf.config.list_physical_devices("GPU")
-    if len(gpus) > 0:
-        # prevent a single tf process from taking up all the GPU memory
-        tf.config.set_logical_device_configuration(
-            gpus[0],
-            [tf.config.LogicalDeviceConfiguration(memory_limit=args.tf_memory_limit)],
-        )
+    if tf is not None:
+        gpus = tf.config.list_physical_devices("GPU")
+        if len(gpus) > 0:
+            tf.config.set_logical_device_configuration(
+                gpus[0],
+                [tf.config.LogicalDeviceConfiguration(memory_limit=args.tf_memory_limit)],
+            )
     print(f"**** {args.policy_model} ****")
     # policy model creation; update this if you are using a new policy model
     if args.policy_model == "rt1":
@@ -73,11 +78,11 @@ if __name__ == "__main__":
         from simpler_env.policies.sim_cogact import CogACTInference
         assert args.ckpt_path is not None
         model = CogACTInference(
-            saved_model_path=args.ckpt_path,  # e.g., CogACT/CogACT-Base
+            saved_model_path=args.ckpt_path,
             policy_setup=args.policy_setup,
             action_scale=args.action_scale,
-            action_model_type='DiT-B',
-            cfg_scale=1.5                     # cfg from 1.5 to 7 also performs well
+            action_model_type=args.action_model_type,
+            cfg_scale=1.5,
         )
     elif args.policy_model == "spatialvla":
         assert args.ckpt_path is not None

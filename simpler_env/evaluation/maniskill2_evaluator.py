@@ -2,9 +2,11 @@
 Evaluate a model on ManiSkill2 environment.
 """
 
+import json
 import os
 
 import numpy as np
+from PIL import Image
 from transforms3d.euler import quat2euler
 
 from simpler_env.utils.env.env_builder import (
@@ -38,6 +40,7 @@ def run_maniskill2_eval_single_episode(
     enable_raytracing=False,
     additional_env_save_tags=None,
     logging_dir="./results",
+    save_rollout_dir=None,
 ):
     if additional_env_build_kwargs is None:
         additional_env_build_kwargs = {}
@@ -107,7 +110,13 @@ def run_maniskill2_eval_single_episode(
 
     timestep = 0
     success = "failure"
-    # action_ensemble = model.action_ensemble_temp  if hasattr(model, "action_ensemble") else "none"
+
+    # Rollout saving state
+    rollout_images = []
+    rollout_eef_poses = []
+    rollout_actions = []
+    rollout_task_descs = []
+    rollout_done = False
 
     # Step the environment
     task_descriptions = []
@@ -129,6 +138,16 @@ def run_maniskill2_eval_single_episode(
                 predicted_terminated = False
                 env.unwrapped.advance_to_next_subtask()
 
+        # Accumulate rollout data at the decision point (before env.step)
+        if save_rollout_dir is not None and not rollout_done:
+            env_action_7d = np.concatenate(
+                [action["world_vector"], action["rot_axangle"], action["gripper"]]
+            )
+            rollout_images.append(image)
+            rollout_eef_poses.append(eef_pos.copy())
+            rollout_actions.append(env_action_7d)
+            rollout_task_descs.append(task_description)
+
         # step the environment
         obs, reward, done, truncated, info = env.step(
             np.concatenate(
@@ -137,6 +156,8 @@ def run_maniskill2_eval_single_episode(
         )
 
         success = "success" if done else "failure"
+        if done and not rollout_done:
+            rollout_done = True
         new_task_description = env.unwrapped.get_language_instruction()
         if new_task_description != task_description:
             task_description = new_task_description
@@ -153,6 +174,27 @@ def run_maniskill2_eval_single_episode(
         timestep += 1
 
     episode_stats = info.get("episode_stats", {})
+
+    # Save rollout data
+    if save_rollout_dir is not None and len(rollout_images) > 0:
+        ep_id = obj_episode_id if obj_episode_id is not None else f"{obj_init_x}_{obj_init_y}"
+        ep_dir = os.path.join(save_rollout_dir, env_name, f"episode_{ep_id:03d}" if isinstance(ep_id, int) else f"episode_{ep_id}")
+        img_dir = os.path.join(ep_dir, "images")
+        os.makedirs(img_dir, exist_ok=True)
+        for i, img in enumerate(rollout_images):
+            Image.fromarray(img).save(os.path.join(img_dir, f"step_{i:04d}.png"))
+        np.save(os.path.join(ep_dir, "eef_poses.npy"), np.array(rollout_eef_poses, dtype=np.float32))
+        np.save(os.path.join(ep_dir, "env_actions.npy"), np.array(rollout_actions, dtype=np.float32))
+        meta = {
+            "env_name": env_name,
+            "task_description": rollout_task_descs[0] if rollout_task_descs else task_description,
+            "num_steps": len(rollout_images),
+            "success": success == "success",
+            "episode_id": int(ep_id) if isinstance(ep_id, int) else str(ep_id),
+        }
+        with open(os.path.join(ep_dir, "metadata.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+        print(f"[rollout] Saved {len(rollout_images)} transitions to {ep_dir}")
 
     # save video
     env_save_name = env_name
@@ -192,6 +234,8 @@ def maniskill2_evaluator(model, args):
     control_mode = get_robot_control_mode(args.robot, args.policy_model)
     success_arr = []
 
+    save_rollout_dir = getattr(args, "save_rollout_dir", None)
+
     # run inference
     for robot_init_x in args.robot_init_xs:
         for robot_init_y in args.robot_init_ys:
@@ -215,6 +259,7 @@ def maniskill2_evaluator(model, args):
                     additional_env_save_tags=args.additional_env_save_tags,
                     obs_camera_name=args.obs_camera_name,
                     logging_dir=args.logging_dir,
+                    save_rollout_dir=save_rollout_dir,
                 )
                 if args.obj_variation_mode == "xy":
                     for obj_init_x in args.obj_init_xs:

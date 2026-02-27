@@ -11,10 +11,24 @@ For N=50K on H100 80GB:
   1 NxN matrix = 9.3 GB
   Peak ~5 NxN = 46.5 GB + ~1 GB overhead = ~48 GB  (fits in 80 GB)
 
+Temporal horizon support (--horizon):
+  When --horizon a > 0, feats_B is loaded from feats_B_seq.pt (N, H+1, D)
+  and sliced to [t, t+1, ..., t+a], then flattened to (N, D*(a+1)).
+  Similarly for actions via --feats_B_seq / --use_actions_seq.
+  This measures CKNNA between VLM features at time t and
+  proprioceptive/action trajectories from t to t+a.
+
 Usage:
   python compute_cknna_large.py \
       --feats_A ./cknna_data_50k/spatialvla-sft-bridge/feats_A.pt \
       --feats_B ./cknna_data_50k/feats_B.pt \
+      --topk 5 10 20
+
+  # Temporal horizon sweep:
+  python compute_cknna_large.py \
+      --feats_A ./cknna_data_50k/spatialvla-sft-bridge/feats_A.pt \
+      --feats_B_seq ./cknna_data_50k/feats_B_seq.pt \
+      --horizon 4 \
       --topk 5 10 20
 """
 
@@ -144,22 +158,51 @@ def mutual_knn_lowmem(feats_A, feats_B, topk=10):
     return result
 
 
+def _load_feats_B(args):
+    """Load feats_B, handling both single-timestep and sequential (temporal) modes."""
+    if args.feats_B_seq is not None:
+        seq = torch.load(args.feats_B_seq, weights_only=True).float()
+        a = args.horizon
+        max_h = seq.shape[1] - 1
+        assert a <= max_h, f"horizon {a} exceeds max available {max_h}"
+        sliced = seq[:, :a + 1, :]
+        flat = sliced.reshape(sliced.shape[0], -1)
+        source_path = args.feats_B_seq
+        print(f"feats_B_seq: {source_path}  raw shape={tuple(seq.shape)}")
+        print(f"  horizon a={a}: sliced to {tuple(sliced.shape)}, flattened to {tuple(flat.shape)}")
+        del seq, sliced
+        return flat, source_path
+    feats_B_raw = torch.load(args.feats_B, weights_only=True).float()
+    return feats_B_raw, args.feats_B
+
+
 def main():
     parser = argparse.ArgumentParser(description="Phase 3: Compute CKNNA (large N, memory-optimized).")
     parser.add_argument("--feats_A", type=str, nargs="+", required=True)
-    parser.add_argument("--feats_B", type=str, required=True)
+    parser.add_argument("--feats_B", type=str, default=None,
+                        help="Path to feats_B.pt (N, D) for single-timestep mode")
+    parser.add_argument("--feats_B_seq", type=str, default=None,
+                        help="Path to feats_B_seq.pt or actions_seq.pt (N, H+1, D) for temporal mode")
+    parser.add_argument("--horizon", type=int, default=0,
+                        help="Temporal horizon a: use states/actions from t to t+a (requires --feats_B_seq)")
     parser.add_argument("--topk", type=int, nargs="+", default=[10])
     parser.add_argument("--also_mutual_knn", action="store_true")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
 
-    feats_B_raw = torch.load(args.feats_B, weights_only=True).float()
+    assert args.feats_B is not None or args.feats_B_seq is not None, \
+        "Provide either --feats_B (single timestep) or --feats_B_seq (temporal)"
+    if args.horizon > 0:
+        assert args.feats_B_seq is not None, \
+            "--horizon > 0 requires --feats_B_seq"
+
+    feats_B_raw, feats_B_source = _load_feats_B(args)
     feats_B_norm = F.normalize(feats_B_raw, p=2, dim=-1).to(args.device)
     N = feats_B_norm.shape[0]
     del feats_B_raw
 
-    print(f"feats_B: {args.feats_B}  shape={tuple(feats_B_norm.shape)}  N={N}")
+    print(f"feats_B effective shape: {tuple(feats_B_norm.shape)}  N={N}")
     print(f"k values: {args.topk}")
     mem_per_mat = N * N * 4 / 1024**3
     print(f"NxN matrix size: {mem_per_mat:.1f} GB  (peak ~5x = {mem_per_mat*5:.1f} GB)")
@@ -168,9 +211,10 @@ def main():
     results = {
         "_meta": {
             "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "feats_B_path": args.feats_B,
+            "feats_B_path": feats_B_source,
             "feats_B_shape": list(feats_B_norm.shape),
             "N": N,
+            "horizon": args.horizon,
             "k_values": args.topk,
             "memory_optimized": True,
         },
