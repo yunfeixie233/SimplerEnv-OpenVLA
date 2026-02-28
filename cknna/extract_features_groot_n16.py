@@ -40,11 +40,52 @@ from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.types import MessageType, VLAStepData
 from gr00t.policy.gr00t_policy import Gr00tPolicy, _rec_to_dtype
 
+from transformers.image_processing_utils_fast import BaseImageProcessorFast
+if not hasattr(BaseImageProcessorFast, "_prepare_input_images"):
+    from functools import partial as _partial
+
+    def _prepare_input_images(self, images, do_convert_rgb, input_data_format, device):
+        images = self._prepare_images_structure(images)
+        fn = _partial(self._process_image, do_convert_rgb=do_convert_rgb,
+                      input_data_format=input_data_format, device=device)
+        return [fn(img) for img in images]
+
+    BaseImageProcessorFast._prepare_input_images = _prepare_input_images
+
 
 def masked_mean_pool(hidden_states, attention_mask):
     h = hidden_states.float()
     m = attention_mask.unsqueeze(-1).float()
     return (h * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
+
+
+def find_subsequence(seq, subseq):
+    n, m = len(seq), len(subseq)
+    if m == 0:
+        return -1
+    for i in range(n - m + 1):
+        if seq[i:i + m] == subseq:
+            return i
+    return -1
+
+
+def build_task_mask(input_ids_1d, tokenizer, task):
+    """Build mask for task-instruction tokens in the input sequence.
+
+    Tries bare encoding first (handles SentencePiece/BPE after non-space chars
+    like <bos> or newline), then falls back to space-prefixed encoding.
+    """
+    mask = torch.zeros(len(input_ids_1d), dtype=torch.long, device=input_ids_1d.device)
+    if not task:
+        return mask
+    ids_list = input_ids_1d.tolist()
+    for prefix in ["", " "]:
+        task_ids = tokenizer.encode(prefix + task, add_special_tokens=False)
+        start = find_subsequence(ids_list, task_ids)
+        if start >= 0:
+            mask[start:start + len(task_ids)] = 1
+            return mask
+    return mask
 
 
 def build_bridge_obs(image_np, task_description):
@@ -119,17 +160,23 @@ def main():
     print(f"  use_alternate_vl_dit: {model.config.use_alternate_vl_dit}")
     print(f"  Samples to process: {num_samples}")
 
-    partial_path = os.path.join(args.output_dir, "feats_A_partial.pt")
-    if args.resume_from > 0 and os.path.exists(partial_path):
-        partial_tensor = torch.load(partial_path, weights_only=True)
-        feats_list = list(partial_tensor[:args.resume_from])
-        print(f"  Resuming from sample {args.resume_from} ({len(feats_list)} loaded)")
-    else:
-        feats_list = []
-        args.resume_from = 0
+    from transformers import AutoTokenizer
+    eagle_dir = os.path.join(
+        os.path.dirname(__import__('gr00t').__file__),
+        "model", "modules", "nvidia", "Eagle-Block2A-2B-v2",
+    )
+    backbone_tokenizer = AutoTokenizer.from_pretrained(
+        eagle_dir, trust_remote_code=True, use_fast=False
+    )
+    image_token_index = model.backbone.model.config.image_token_index
+    print(f"  image_token_index: {image_token_index}")
+
+    feats_imgtext_list = []
+    feats_img_list = []
+    feats_txt_list = []
 
     t0 = time.time()
-    for i in range(args.resume_from, num_samples):
+    for i in range(num_samples):
         img = np.array(
             Image.open(os.path.join(images_dir, f"{i:06d}.png")).convert("RGB")
         )
@@ -146,51 +193,50 @@ def main():
 
         backbone_features = backbone_outputs["backbone_features"]
         backbone_mask = backbone_outputs["backbone_attention_mask"]
+        image_mask = backbone_outputs["image_mask"]
 
-        feat = masked_mean_pool(backbone_features, backbone_mask).squeeze(0).cpu()
-        feats_list.append(feat)
+        feat_imgtext = masked_mean_pool(backbone_features, backbone_mask).squeeze(0).cpu()
+
+        feat_img = masked_mean_pool(backbone_features, image_mask.to(backbone_mask.dtype)).squeeze(0).cpu()
+
+        input_ids = backbone_inputs["input_ids"]
+        task_mask = build_task_mask(input_ids[0], backbone_tokenizer, task).unsqueeze(0)
+        feat_txt = masked_mean_pool(backbone_features, task_mask).squeeze(0).cpu()
+
+        feats_imgtext_list.append(feat_imgtext)
+        feats_img_list.append(feat_img)
+        feats_txt_list.append(feat_txt)
 
         if (i + 1) % 100 == 0 or i == 0:
             elapsed = time.time() - t0
-            done = i + 1 - args.resume_from
-            rate = done / elapsed if elapsed > 0 else 0
+            rate = (i + 1) / elapsed if elapsed > 0 else 0
             eta = (num_samples - i - 1) / rate if rate > 0 else 0
             print(
                 f"  [{i+1}/{num_samples}]  shape=({hidden_size},)  "
                 f"rate={rate:.1f}/s  ETA={eta/60:.1f}min"
             )
 
-        if (i + 1) % args.save_every == 0:
-            torch.save(torch.stack(feats_list), partial_path)
-
-    feats_A = torch.stack(feats_list)
-    feats_A_path = os.path.join(args.output_dir, "feats_A.pt")
-    torch.save(feats_A, feats_A_path)
-
-    if os.path.exists(partial_path):
-        os.remove(partial_path)
+    for suffix, flist in [("feats_A", feats_imgtext_list),
+                          ("feats_A_img", feats_img_list),
+                          ("feats_A_txt", feats_txt_list)]:
+        t = torch.stack(flist)
+        p = os.path.join(args.output_dir, f"{suffix}.pt")
+        torch.save(t, p)
+        print(f"  Saved {p}  shape={tuple(t.shape)}")
 
     extraction_meta = {
         "model": "GR00T-N1.6-bridge",
         "checkpoint_path": args.ckpt,
-        "extraction_point": (
-            "EagleBackbone.hidden_states[-1] after truncation to 16 layers "
-            "(POST-norm Qwen3 RMSNorm, Eagle-Block2A-2B-v2)"
-        ),
-        "pooling": "masked_mean_pool (backbone_attention_mask, vision+text tokens)",
         "hidden_size": hidden_size,
-        "feats_A_shape": list(feats_A.shape),
         "num_samples": num_samples,
-        "state_in_feats_A": False,
-        "state_note": "State enters only action_head.state_encoder, not backbone",
-        "vlm_backbone": "Eagle-Block2A-2B-v2 (SigLIP2 + Qwen3-1.7B, 16 layers, top 4 tuned)",
+        "outputs": ["feats_A.pt", "feats_A_img.pt", "feats_A_txt.pt"],
+        "image_token_index": image_token_index,
     }
     with open(os.path.join(args.output_dir, "extraction_metadata.json"), "w") as f:
         json.dump(extraction_meta, f, indent=2)
 
     elapsed = time.time() - t0
-    print(f"\n=== GR00T N1.6 Backbone Extraction Complete ===")
-    print(f"  feats_A: {feats_A_path}  shape={tuple(feats_A.shape)}")
+    print(f"\n=== GR00T N1.6 Phase 2 Complete ===")
     print(f"  Time: {elapsed/60:.1f} min  ({elapsed/num_samples:.2f} s/sample)")
 
 

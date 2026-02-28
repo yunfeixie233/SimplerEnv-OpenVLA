@@ -40,20 +40,45 @@ from PIL import Image
 
 
 def masked_mean_pool(hidden_states, mask):
-    """Mean-pool hidden states over valid (non-padding) tokens.
-
-    Matches the StarVLA extract_features_starvla.py implementation exactly.
-
-    Args:
-        hidden_states: (B, seq_len, D)
-        mask: (B, seq_len) bool or int
-
-    Returns:
-        pooled: (B, D) float32
-    """
+    """Mean-pool hidden states over valid (non-padding) tokens."""
     h = hidden_states.float()
     m = mask.unsqueeze(-1).float()
     return (h * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
+
+
+def find_subsequence(seq, subseq):
+    n, m = len(seq), len(subseq)
+    if m == 0:
+        return -1
+    for i in range(n - m + 1):
+        if seq[i:i + m] == subseq:
+            return i
+    return -1
+
+
+def build_task_mask_pi0(lang_tokens_1d, tokenizer, task, n_img, prefix_len, device):
+    """Build task-only mask in prefix space [img_embs, lang_embs].
+
+    lang_tokens_1d: (lang_seq_len,) -- tokenized language input (with padding/special)
+    tokenizer: the tokenizer used to encode the task
+    task: str -- task description
+    n_img: int -- number of image tokens at the start of prefix
+    prefix_len: int -- total prefix length (n_img + lang_seq_len)
+
+    Tries bare encoding first (handles SentencePiece/BPE after non-space chars),
+    then falls back to space-prefixed encoding.
+    """
+    mask = torch.zeros(prefix_len, dtype=torch.long, device=device)
+    if not task:
+        return mask
+    ids_list = lang_tokens_1d.tolist()
+    for prefix in ["", " "]:
+        task_ids = tokenizer.encode(prefix + task, add_special_tokens=False)
+        start = find_subsequence(ids_list, task_ids)
+        if start >= 0:
+            mask[n_img + start:n_img + start + len(task_ids)] = 1
+            return mask
+    return mask
 
 
 def resolve_hook_module(model):
@@ -158,21 +183,15 @@ def main():
     weight_dtype = model.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
     print(f"  Model dtype: {weight_dtype}")
 
-    # ---- Resume support ----
-    partial_path = os.path.join(args.output_dir, "feats_A_partial.pt")
-    if args.resume_from > 0 and os.path.exists(partial_path):
-        partial_tensor = torch.load(partial_path, weights_only=True)
-        feats_list = list(partial_tensor[:args.resume_from])
-        print(f"  Resuming from sample {args.resume_from} ({len(feats_list)} loaded)")
-    else:
-        feats_list = []
-        args.resume_from = 0
-
     OBS_LANGUAGE_TOKENS = "observation.language.tokens"
     OBS_LANGUAGE_ATTENTION_MASK = "observation.language.attention_mask"
 
+    feats_imgtext_list = []
+    feats_img_list = []
+    feats_txt_list = []
+
     t0 = time.time()
-    for i in range(args.resume_from, num_samples):
+    for i in range(num_samples):
         img_np = np.array(Image.open(os.path.join(images_dir, f"{i:06d}.png")).convert("RGB"))
         task = task_descriptions[i]
 
@@ -215,44 +234,54 @@ def main():
                 use_cache=False,
             )
 
-        feat = masked_mean_pool(hook_output["feat"], prefix_pad_masks).squeeze(0).cpu()
-        feats_list.append(feat)
+        hidden = hook_output["feat"]
+        prefix_len = prefix_pad_masks.shape[1]
+        n_img = prefix_len - lang_tokens.shape[1]
+
+        feat_imgtext = masked_mean_pool(hidden, prefix_pad_masks).squeeze(0).cpu()
+
+        img_mask = torch.zeros_like(prefix_pad_masks)
+        img_mask[0, :n_img] = prefix_pad_masks[0, :n_img]
+        feat_img = masked_mean_pool(hidden, img_mask).squeeze(0).cpu()
+
+        task_mask = build_task_mask_pi0(
+            lang_tokens[0], tokenizer, task, n_img, prefix_len, lang_tokens.device
+        ).unsqueeze(0)
+        feat_txt = masked_mean_pool(hidden, task_mask).squeeze(0).cpu()
+
+        feats_imgtext_list.append(feat_imgtext)
+        feats_img_list.append(feat_img)
+        feats_txt_list.append(feat_txt)
 
         if (i + 1) % 100 == 0 or i == 0:
             elapsed = time.time() - t0
-            done = i + 1 - args.resume_from
-            rate = done / elapsed if elapsed > 0 else 0
+            rate = (i + 1) / elapsed if elapsed > 0 else 0
             eta = (num_samples - i - 1) / rate if rate > 0 else 0
             print(f"  [{i+1}/{num_samples}]  shape=({hidden_size},)  "
                   f"rate={rate:.1f}/s  ETA={eta/60:.1f}min")
 
-        if (i + 1) % args.save_every == 0:
-            torch.save(torch.stack(feats_list), partial_path)
-
     handle.remove()
 
-    feats_A = torch.stack(feats_list)
-    feats_A_path = os.path.join(args.output_dir, "feats_A.pt")
-    torch.save(feats_A, feats_A_path)
-
-    if os.path.exists(partial_path):
-        os.remove(partial_path)
+    for suffix, flist in [("feats_A", feats_imgtext_list),
+                          ("feats_A_img", feats_img_list),
+                          ("feats_A_txt", feats_txt_list)]:
+        t = torch.stack(flist)
+        p = os.path.join(args.output_dir, f"{suffix}.pt")
+        torch.save(t, p)
+        print(f"  Saved {p}  shape={tuple(t.shape)}")
 
     extraction_meta = {
         "model": args.ckpt_path,
         "extraction_point": "hook on language_model.norm (post-norm GemmaModel)",
-        "pooling": "masked_mean_pool (prefix_pad_masks)",
         "hidden_size": hidden_size,
-        "feats_A_shape": list(feats_A.shape),
         "num_samples": num_samples,
-        "tokenizer_max_length": tokenizer_max_length,
+        "outputs": ["feats_A.pt", "feats_A_img.pt", "feats_A_txt.pt"],
     }
     with open(os.path.join(args.output_dir, "extraction_metadata.json"), "w") as f:
         json.dump(extraction_meta, f, indent=2)
 
     elapsed = time.time() - t0
     print(f"\n=== Pi0 Lerobot Phase 2 Complete ===")
-    print(f"  feats_A: {feats_A_path}  shape={tuple(feats_A.shape)}")
     print(f"  Time: {elapsed/60:.1f} min  ({elapsed/num_samples:.2f} s/sample)")
 
 

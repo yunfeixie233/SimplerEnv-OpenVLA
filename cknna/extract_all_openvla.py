@@ -1,29 +1,19 @@
 """
-Phase 2: Extract VLM features (feats_A) from OpenVLA-7B for CKNNA.
+Unified extraction script: Extract both feats_A (VLM hidden states) and feats_action
+(action representations) from OpenVLA-7B in a SINGLE generate() call per sample.
 
-Loads the OpenVLA checkpoint, runs a forward pass with
-output_hidden_states=True on each (image, task) pair from Phase 1 data,
-and saves the masked-mean-pooled last hidden state as feats_A.
+Key insight: generate() with output_hidden_states=True returns:
+- hidden_states[0][-1] = prefill step last-layer hidden states (feats_A)
+- hidden_states[1:][-1] = each generated token's last-layer hidden states (feats_action)
 
-Architecture: Prismatic VLM (DINOv2 + SigLIP fused vision + Llama-2-7b LM, hidden_size=4096)
-Extraction point: hidden_states[-1] (POST-norm, after final Llama-2 RMSNorm)
-Pooling: masked mean-pool over non-padding tokens in the multimodal sequence
-         (includes both projected vision patches and text tokens)
-
-The multimodal sequence is: [BOS, vision_patches, text_tokens_after_BOS]
-where vision patches are always valid (mask=1). The multimodal_attention_mask
-is reconstructed from the original attention_mask since it is built internally
-by PrismaticForConditionalGeneration.forward().
-
-Prompt format: "In: What action should the robot take to {instruction}?\\nOut:"
-
-Requires: conda env with transformers==4.40.1, timm==0.9.16, torch>=2.1
+Architecture: Prismatic VLM (CLIP + SigLIP vision + Llama-2-7B LM, hidden_size=4096)
 
 Usage:
-    python extract_features_openvla.py \
+    python extract_all_openvla.py \
         --ckpt $WORK/SimplerEnv-OpenVLA/checkpoints/openvla-7b \
         --data_dir ./cknna_data \
-        --output_dir ./cknna_data/openvla-7b-bridge
+        --output_dir ./cknna_data/openvla-7b-bridge \
+        --seed 42
 """
 
 import argparse
@@ -37,7 +27,6 @@ from transformers import AutoModelForVision2Seq, AutoProcessor
 
 
 def masked_mean_pool(hidden_states, attention_mask):
-    """Mean-pool hidden states over valid (non-padding) tokens."""
     h = hidden_states.float()
     m = attention_mask.unsqueeze(-1).float()
     return (h * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
@@ -54,15 +43,6 @@ def find_subsequence(seq, subseq):
 
 
 def build_task_mask_prismatic(input_ids_1d, tokenizer, task, num_patches):
-    """Build task-instruction-only mask in multimodal sequence space.
-
-    Prismatic multimodal sequence: [BOS, vision_patches, text_after_BOS].
-    Task tokens appear within text_after_BOS. We find them in input_ids
-    (text-only space) then offset by num_patches to map to multimodal positions.
-
-    Tries bare encoding first (handles SentencePiece/BPE after non-space chars),
-    then falls back to space-prefixed encoding.
-    """
     multimodal_len = len(input_ids_1d) + num_patches
     device = input_ids_1d.device
     mask = torch.zeros(multimodal_len, dtype=torch.long, device=device)
@@ -80,17 +60,17 @@ def build_task_mask_prismatic(input_ids_1d, tokenizer, task, num_patches):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Phase 2: Extract OpenVLA features for CKNNA.")
+    parser = argparse.ArgumentParser(description="Unified extraction: feats_A + feats_action")
     script_dir = os.path.dirname(os.path.abspath(__file__))
     default_ckpt = os.path.join(script_dir, "..", "checkpoints", "openvla-7b")
-    parser.add_argument("--ckpt", type=str,
-                        default=default_ckpt,
+    parser.add_argument("--ckpt", type=str, required=True,
                         help="HuggingFace model ID or local path")
     parser.add_argument("--data_dir", type=str, required=True,
                         help="Phase 1 data directory (images/, metadata.json)")
     parser.add_argument("--output_dir", type=str, required=True,
-                        help="Where to save feats_A.pt")
+                        help="Where to save feats_A.pt and feats_action.pt")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume_from", type=int, default=0)
     parser.add_argument("--save_every", type=int, default=500)
     args = parser.parse_args()
@@ -116,30 +96,41 @@ def main():
     print(f"  hidden_size: {hidden_size}")
     print(f"  vision_backbone_id: {model.config.vision_backbone_id}")
     print(f"  llm_backbone_id: {model.config.llm_backbone_id}")
-    print(f"  use_fused_vision_backbone: {model.config.use_fused_vision_backbone}")
     print(f"  Samples to process: {num_samples}")
 
     tokenizer = processor.tokenizer
 
-    _hook_output = {}
-
-    def _lm_pre_hook(_module, args, kwargs):
-        kwargs["output_hidden_states"] = True
-        kwargs["return_dict"] = True
-        return args, kwargs
-
-    def _lm_post_hook(_module, _input, output):
-        _hook_output["hidden_states"] = output.hidden_states
-
-    h1 = model.language_model.register_forward_pre_hook(_lm_pre_hook, with_kwargs=True)
-    h2 = model.language_model.register_forward_hook(_lm_post_hook)
+    vb = model.vision_backbone
+    if hasattr(vb, 'get_num_patches'):
+        num_patches = vb.get_num_patches() * vb.get_num_images_in_input()
+    else:
+        num_patches = vb.featurizer.patch_embed.num_patches
 
     feats_imgtext_list = []
     feats_img_list = []
     feats_txt_list = []
+    feats_action_list = []
+
+    partial_feats_A_path = os.path.join(args.output_dir, "feats_A_partial.pt")
+    partial_feats_action_path = os.path.join(args.output_dir, "feats_action_partial.pt")
+    
+    if args.resume_from > 0:
+        if os.path.exists(partial_feats_A_path):
+            partial_feats_A = torch.load(partial_feats_A_path, weights_only=True)
+            feats_imgtext_list = list(partial_feats_A[:args.resume_from, 0])
+            feats_img_list = list(partial_feats_A[:args.resume_from, 1])
+            feats_txt_list = list(partial_feats_A[:args.resume_from, 2])
+        if os.path.exists(partial_feats_action_path):
+            partial_feats_action = torch.load(partial_feats_action_path, weights_only=True)
+            feats_action_list = list(partial_feats_action[:args.resume_from])
+        print(f"  Resuming from sample {args.resume_from}")
+    else:
+        args.resume_from = 0
+
+    torch.manual_seed(args.seed)
 
     t0 = time.time()
-    for i in range(num_samples):
+    for i in range(args.resume_from, num_samples):
         img = Image.open(os.path.join(images_dir, f"{i:06d}.png")).convert("RGB")
         task = task_descriptions[i]
 
@@ -151,23 +142,21 @@ def main():
         pixel_values = inputs["pixel_values"].to(dtype=torch.bfloat16, device=args.device)
 
         with torch.inference_mode():
-            model(
+            outputs = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 pixel_values=pixel_values,
+                max_new_tokens=7,
+                do_sample=False,
+                output_hidden_states=True,
+                return_dict_in_generate=True,
             )
 
-        last_hidden = _hook_output["hidden_states"][-1]
-
+        prefill_hidden = outputs.hidden_states[0][-1]
+        
         text_seq_len = input_ids.shape[1]
-        vb = model.vision_backbone
-        if hasattr(vb, 'get_num_patches'):
-            num_patches = vb.get_num_patches() * vb.get_num_images_in_input()
-        else:
-            num_patches = vb.featurizer.patch_embed.num_patches
-
         multimodal_len = 1 + num_patches + (text_seq_len - 1)
-        last_hidden_trimmed = last_hidden[:, :multimodal_len, :]
+        prefill_hidden_trimmed = prefill_hidden[:, :multimodal_len, :]
 
         patch_mask = torch.ones(
             (1, num_patches), dtype=attention_mask.dtype, device=attention_mask.device
@@ -176,49 +165,78 @@ def main():
             [attention_mask[:, :1], patch_mask, attention_mask[:, 1:]], dim=1
         )
 
-        feat_imgtext = masked_mean_pool(last_hidden_trimmed, multimodal_mask).squeeze(0).cpu()
+        feat_imgtext = masked_mean_pool(prefill_hidden_trimmed, multimodal_mask).squeeze(0).cpu()
 
         image_mask = torch.zeros_like(multimodal_mask)
         image_mask[0, 1:1 + num_patches] = 1
-        feat_img = masked_mean_pool(last_hidden_trimmed, image_mask).squeeze(0).cpu()
+        feat_img = masked_mean_pool(prefill_hidden_trimmed, image_mask).squeeze(0).cpu()
 
         task_mask = build_task_mask_prismatic(input_ids[0], tokenizer, task, num_patches).unsqueeze(0)
-        feat_txt = masked_mean_pool(last_hidden_trimmed, task_mask).squeeze(0).cpu()
+        feat_txt = masked_mean_pool(prefill_hidden_trimmed, task_mask).squeeze(0).cpu()
 
         feats_imgtext_list.append(feat_imgtext)
         feats_img_list.append(feat_img)
         feats_txt_list.append(feat_txt)
 
+        num_gen_steps = len(outputs.hidden_states) - 1
+        if num_gen_steps == 0:
+            feats_action_list.append(torch.zeros(hidden_size, dtype=torch.float32))
+        else:
+            action_hidden = []
+            for t in range(1, len(outputs.hidden_states)):
+                last_layer = outputs.hidden_states[t][-1]
+                action_hidden.append(last_layer)
+
+            action_repr = torch.cat(action_hidden, dim=1)
+            feat_action = action_repr.float().mean(dim=1).squeeze(0).cpu()
+            feats_action_list.append(feat_action)
+
         if (i + 1) % 100 == 0 or i == 0:
             elapsed = time.time() - t0
-            rate = (i + 1) / elapsed if elapsed > 0 else 0
+            done = i + 1 - args.resume_from
+            rate = done / elapsed if elapsed > 0 else 0
             eta = (num_samples - i - 1) / rate if rate > 0 else 0
-            print(f"  [{i+1}/{num_samples}]  shape=({hidden_size},)  "
-                  f"rate={rate:.1f}/s  ETA={eta/60:.1f}min")
+            print(f"  [{i+1}/{num_samples}]  gen_tokens={num_gen_steps}  "
+                  f"rate={rate:.1f}/s  ETA={eta/60:.1f}min", flush=True)
 
-    h1.remove()
-    h2.remove()
+        if (i + 1) % args.save_every == 0:
+            feats_A_partial = torch.stack([
+                torch.stack([feats_imgtext_list[j], feats_img_list[j], feats_txt_list[j]])
+                for j in range(len(feats_imgtext_list))
+            ])
+            torch.save(feats_A_partial, partial_feats_A_path)
+            torch.save(torch.stack(feats_action_list), partial_feats_action_path)
 
-    for suffix, flist in [("feats_A", feats_imgtext_list),
-                          ("feats_A_img", feats_img_list),
-                          ("feats_A_txt", feats_txt_list)]:
-        t = torch.stack(flist)
+    feats_A = torch.stack([
+        torch.stack([feats_imgtext_list[j], feats_img_list[j], feats_txt_list[j]])
+        for j in range(len(feats_imgtext_list))
+    ])
+    feats_action = torch.stack(feats_action_list)
+
+    for suffix, tensor in [("feats_A", feats_A[:, 0]), ("feats_A_img", feats_A[:, 1]), 
+                          ("feats_A_txt", feats_A[:, 2]), ("feats_action", feats_action)]:
         p = os.path.join(args.output_dir, f"{suffix}.pt")
-        torch.save(t, p)
-        print(f"  Saved {p}  shape={tuple(t.shape)}")
+        torch.save(tensor, p)
+        print(f"  Saved {p}  shape={tuple(tensor.shape)}")
+
+    if os.path.exists(partial_feats_A_path):
+        os.remove(partial_feats_A_path)
+    if os.path.exists(partial_feats_action_path):
+        os.remove(partial_feats_action_path)
 
     extraction_meta = {
         "model": args.ckpt,
-        "extraction_point": "hidden_states[-1] (post-norm Llama-2 RMSNorm, via hook)",
+        "extraction_point": "generate() hidden_states[0][-1] (prefill) + hidden_states[1:][-1] (gen tokens)",
         "hidden_size": hidden_size,
         "num_samples": num_samples,
-        "outputs": ["feats_A.pt", "feats_A_img.pt", "feats_A_txt.pt"],
+        "seed": args.seed,
+        "outputs": ["feats_A.pt", "feats_A_img.pt", "feats_A_txt.pt", "feats_action.pt"],
     }
     with open(os.path.join(args.output_dir, "extraction_metadata.json"), "w") as f:
         json.dump(extraction_meta, f, indent=2)
 
     elapsed = time.time() - t0
-    print(f"\n=== OpenVLA Phase 2 Complete ===")
+    print(f"\n=== Unified Extraction Complete ===")
     print(f"  Time: {elapsed/60:.1f} min  ({elapsed/num_samples:.2f} s/sample)")
 
 
